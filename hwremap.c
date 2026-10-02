@@ -129,9 +129,9 @@ static int add_tok(struct action *a, const char *tok)
     unsigned char b[6];
     switch (kind) {
     case 'd': b[0] = 0x90; b[1] = v; b[2] = 0x7f; n = 3; break;
-    case 'u': b[0] = 0x80; b[1] = v; b[2] = 0x7f; n = 3; break;
-    case 'b': b[0] = 0x90; b[1] = v; b[2] = 0x7f; b[3] = 0x80; b[4] = v; b[5] = 0x7f; n = 6; break;
-    case 'p': b[0] = 0x99; b[1] = v; b[2] = 0x7f; b[3] = 0x89; b[4] = v; b[5] = 0x00; n = 6; break;
+    case 'u': b[0] = 0x90; b[1] = v; b[2] = 0x00; n = 3; break;
+    case 'b': b[0] = 0x90; b[1] = v; b[2] = 0x7f; b[3] = 0x90; b[4] = v; b[5] = 0x00; n = 6; break;
+    case 'p': b[0] = 0x99; b[1] = v; b[2] = 0x7f; b[3] = 0x99; b[4] = v; b[5] = 0x00; n = 6; break;
     case 'x': b[0] = v; n = 1; break;
     default: return -1;
     }
@@ -261,7 +261,7 @@ static int push_mode(const char *name)
         if (strcmp(grid[slot], name))
             continue;
         unsigned char pad = slot_pad[slot];
-        const unsigned char s[] = {0x90, MENU_NOTE, 0x7f, 0x99, pad, 0x7f, 0x89, pad, 0x00, 0x80, MENU_NOTE, 0x7f};
+        const unsigned char s[] = {0x90, MENU_NOTE, 0x7f, 0x99, pad, 0x7f, 0x99, pad, 0x00, 0x90, MENU_NOTE, 0x00};
         for (size_t i = 0; i < sizeof s; i++)
             push(s[i]);
         logf_("mode '%s' -> slot %d\n", name, slot);
