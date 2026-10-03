@@ -1,4 +1,4 @@
-# hwremap
+# akai_standalone_remap
 
 Remap the hardware buttons of standalone Akai MPC / Force devices: open any screen from any button,
 add double taps, long presses and Shift layers. Tested on a first-generation MPC Live (Hakai,
