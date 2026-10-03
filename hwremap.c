@@ -5,16 +5,28 @@
 // Config (re-read whenever its mtime changes): /sdcard/hwremap.conf
 //   log 1                     log every input byte to /tmp/hwremap.log
 //   hold 49                   while this button is held, remapped buttons pass through
+//   held 1 u49 b1 d49         ...unless a "held" rule exists for them: run it instead
+//   tap 1 d49 b1 u49          short press runs this on release; held past longms (default 400)
+//                             the button itself goes through, down at the threshold, up on release
+//   long 1 b1                 ...or this runs at the threshold instead
+//   dbl 1 h1                  with a tap rule: a second press within dblms runs this (the tap
+//                             waits out the window); hN holds N down while the button is held,
+//                             at least holdms (default 800)
 //   54 d123 p49 u123          on press of note 54: Menu down, tap pad note 49, Menu up
 //   54 mClip_Matrix           Menu + the pad under that mode in the Mode Menu grid
-//   dbl 55 b116               second press within dblms (default 350) runs this instead
+//   dbl 55 b116               second press within dblms (default 350) runs this instead;
+//                             without a single rule the first press passes through
 //   dblms 350
-// Tokens: dN button down, uN button up, bN button tap, pN pad tap, xHH raw byte,
+//   dbl 2 t331,655            tap the touchscreen at x,y (raw touch units), touchms later
+//   touchms 150
+// Tokens: dN button down, uN button up, bN button tap, pN pad tap, xHH raw byte, tX,Y touch, hN hold,
 // mName (underscores = spaces; looked up in MPC.settings at press time, used alone).
 // N is decimal or 0x hex. The source button's release is swallowed.
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -23,6 +35,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
+#include <unistd.h>
 
 typedef struct _snd_rawmidi snd_rawmidi_t;
 typedef struct _snd_rawmidi_info snd_rawmidi_info_t;
@@ -35,6 +48,9 @@ typedef struct _snd_rawmidi_info snd_rawmidi_info_t;
 #endif
 #ifndef SETTINGS_PATH
 #define SETTINGS_PATH "/media/az01-internal/Settings/MPC/MPC.settings"
+#endif
+#ifndef TOUCH_PATH
+#define TOUCH_PATH "/dev/input/event0"
 #endif
 #define MENU_NOTE 123
 #define MENU_GRID_PAGE "ModeMenuPage1Slot"
@@ -53,11 +69,21 @@ struct action {
     unsigned char seq[MAX_SEQ];
     int len;
     char mode[MODE_NAME_MAX];
+    int touch, tx, ty;
+    int keep; // button + 1 held down while the source button is held
 };
 
-static struct action single[128], dbl[128];
+static struct action single[128], dbl[128], shifted[128], tapped[128], longp[128];
+static int long_ms = 400, hold_ms = 800;
+static int tap_pending[128], long_active[128], tap_wait[128];
+static int keep_out[128], keep_up_btn[128];
+static long long keep_start[128];
+static unsigned press_seq[128];
+static int priv_fd = -1;
+static int wake_fd[2] = {-1, -1};
 static long long last_press[128];
 static int dbl_ms = 350;
+static int touch_ms = 150;
 
 // pad note for each Mode Menu grid slot: slot 0 is top left (pad 13), rows go down
 static const unsigned char slot_pad[16] = {
@@ -122,9 +148,26 @@ static int add_tok(struct action *a, const char *tok)
                 *c = ' ';
         return a->mode[0] ? 0 : -1;
     }
+    if (kind == 't') {
+        char *end;
+        long x = strtol(tok + 1, &end, 0);
+        if (*end != ',')
+            return -1;
+        long y = strtol(end + 1, &end, 0);
+        if (*end || x < 0 || y < 0 || x > 65535 || y > 65535)
+            return -1;
+        a->touch = 1;
+        a->tx = (int)x;
+        a->ty = (int)y;
+        return 0;
+    }
     long v = strtol(tok + 1, NULL, kind == 'x' ? 16 : 0);
     if (v < 0 || v > (kind == 'x' ? 255 : 127))
         return -1;
+    if (kind == 'h') {
+        a->keep = (int)v + 1;
+        return 0;
+    }
     int n = 0;
     unsigned char b[6];
     switch (kind) {
@@ -146,9 +189,15 @@ static void reset_conf(void)
 {
     memset(single, 0, sizeof single);
     memset(dbl, 0, sizeof dbl);
+    memset(shifted, 0, sizeof shifted);
+    memset(tapped, 0, sizeof tapped);
+    memset(longp, 0, sizeof longp);
+    long_ms = 400;
+    hold_ms = 800;
     hold_note = -1;
     log_on = 0;
     dbl_ms = 350;
+    touch_ms = 150;
 }
 
 static void load_conf(void)
@@ -194,9 +243,24 @@ static void load_conf(void)
             dbl_ms = v ? atoi(v) : 350;
             continue;
         }
+        if (!strcmp(w, "touchms")) {
+            char *v = strtok_r(NULL, " \t\r\n", &save);
+            touch_ms = v ? atoi(v) : 150;
+            continue;
+        }
+        if (!strcmp(w, "longms")) {
+            char *v = strtok_r(NULL, " \t\r\n", &save);
+            long_ms = v ? atoi(v) : 400;
+            continue;
+        }
+        if (!strcmp(w, "holdms")) {
+            char *v = strtok_r(NULL, " \t\r\n", &save);
+            hold_ms = v ? atoi(v) : 800;
+            continue;
+        }
         struct action *table = single;
-        if (!strcmp(w, "dbl")) {
-            table = dbl;
+        if (!strcmp(w, "dbl") || !strcmp(w, "held") || !strcmp(w, "tap") || !strcmp(w, "long")) {
+            table = w[0] == 'd' ? dbl : w[0] == 'h' ? shifted : w[0] == 't' ? tapped : longp;
             w = strtok_r(NULL, " \t\r\n", &save);
             if (!w)
                 continue;
@@ -271,9 +335,72 @@ static int push_mode(const char *name)
     return 0;
 }
 
+// struct input_event with the kernel's native-long time fields
+struct ev {
+    unsigned long sec, usec;
+    unsigned short type, code;
+    int value;
+};
+
+struct tap {
+    int x, y, delay_ms;
+};
+
+static void *tap_thread(void *arg)
+{
+    struct tap t = *(struct tap *)arg;
+    free(arg);
+    struct timespec d = {t.delay_ms / 1000, (long)(t.delay_ms % 1000) * 1000000};
+    nanosleep(&d, NULL);
+    int fd = open(TOUCH_PATH, O_WRONLY);
+    if (fd < 0) {
+        logf_("touch open failed\n");
+        return NULL;
+    }
+    static int tracking_id = 30000;
+    const struct ev down[] = {
+        {0, 0, 3, 0x39, tracking_id++ & 0xffff}, // ABS_MT_TRACKING_ID
+        {0, 0, 3, 0x35, t.x},                   // ABS_MT_POSITION_X
+        {0, 0, 3, 0x36, t.y},                   // ABS_MT_POSITION_Y
+        {0, 0, 1, 0x14a, 1},                    // BTN_TOUCH
+        {0, 0, 3, 0x00, t.x},                   // ABS_X
+        {0, 0, 3, 0x01, t.y},                   // ABS_Y
+        {0, 0, 0, 0, 0},                        // SYN_REPORT
+    };
+    const struct ev up[] = {
+        {0, 0, 3, 0x39, -1},
+        {0, 0, 1, 0x14a, 0},
+        {0, 0, 0, 0, 0},
+    };
+    ssize_t w = write(fd, down, sizeof down);
+    struct timespec hold = {0, 40 * 1000000};
+    nanosleep(&hold, NULL);
+    w += write(fd, up, sizeof up);
+    close(fd);
+    logf_("touch %d,%d (%zd bytes)\n", t.x, t.y, w);
+    return NULL;
+}
+
+static void start_tap(int x, int y)
+{
+    struct tap *t = malloc(sizeof *t);
+    if (!t)
+        return;
+    t->x = x;
+    t->y = y;
+    t->delay_ms = touch_ms;
+    pthread_t th;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&th, &attr, tap_thread, t) != 0)
+        free(t);
+    pthread_attr_destroy(&attr);
+}
+
 static int mapped(const struct action *a)
 {
-    return a->len || a->mode[0];
+    return a->len || a->mode[0] || a->touch || a->keep;
 }
 
 static int run_action(const struct action *a)
@@ -282,6 +409,8 @@ static int run_action(const struct action *a)
         return 0;
     for (int i = 0; i < a->len; i++)
         push(a->seq[i]);
+    if (a->touch)
+        start_tap(a->tx, a->ty);
     return 1;
 }
 
@@ -292,6 +421,79 @@ static long long now_ms(void)
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+static void wake_reader(void)
+{
+    if (wake_fd[1] >= 0) {
+        char c = 1;
+        ssize_t r = write(wake_fd[1], &c, 1);
+        (void)r;
+    }
+}
+
+static void push_btn(int note, int vel)
+{
+    push(0x90);
+    push((unsigned char)note);
+    push((unsigned char)vel);
+}
+
+enum { T_LONG, T_WAIT, T_KEEPUP };
+
+struct timer {
+    int note, kind, delay_ms;
+    unsigned seq;
+};
+
+static void *timer_thread(void *arg)
+{
+    struct timer t = *(struct timer *)arg;
+    free(arg);
+    struct timespec d = {t.delay_ms / 1000, (long)(t.delay_ms % 1000) * 1000000};
+    nanosleep(&d, NULL);
+    pthread_mutex_lock(&lock);
+    int n = t.note;
+    if (t.kind == T_KEEPUP) {
+        push_btn(keep_up_btn[n], 0);
+        wake_reader();
+    } else if (press_seq[n] == t.seq && t.kind == T_LONG && tap_pending[n]) {
+        tap_pending[n] = 0;
+        if (mapped(&longp[n])) {
+            run_action(&longp[n]);
+            swallow_release[n] = 1;
+        } else {
+            long_active[n] = 1;
+            push_btn(n, 0x7f);
+        }
+        logf_("long press %d\n", n);
+        wake_reader();
+    } else if (press_seq[n] == t.seq && t.kind == T_WAIT && tap_wait[n]) {
+        tap_wait[n] = 0;
+        run_action(&tapped[n]);
+        logf_("remap %d (tap)\n", n);
+        wake_reader();
+    }
+    pthread_mutex_unlock(&lock);
+    return NULL;
+}
+
+static void start_timer(int note, int kind, int delay_ms)
+{
+    struct timer *t = malloc(sizeof *t);
+    if (!t)
+        return;
+    t->note = note;
+    t->kind = kind;
+    t->delay_ms = delay_ms;
+    t->seq = kind == T_KEEPUP ? 0 : ++press_seq[note];
+    pthread_t th;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&th, &attr, timer_thread, t) != 0)
+        free(t);
+    pthread_attr_destroy(&attr);
+}
+
 static void handle_msg(void)
 {
     int st = msg[0] & 0xf0, ch = msg[0] & 0x0f;
@@ -299,7 +501,61 @@ static void handle_msg(void)
         int note = msg[1];
         int press = st == 0x90 && msg[2] > 0;
         load_conf();
-        if (press && mapped(&single[note]) && !(hold_note >= 0 && held[hold_note])) {
+        int holding = hold_note >= 0 && held[hold_note];
+        if (!press && keep_out[note]) {
+            int btn = keep_out[note] - 1;
+            keep_out[note] = 0;
+            long long left = hold_ms - (now_ms() - keep_start[note]);
+            if (left > 0) {
+                keep_up_btn[note] = btn;
+                start_timer(note, T_KEEPUP, (int)left);
+            } else {
+                push_btn(btn, 0);
+            }
+            return;
+        }
+        if (!press && tap_pending[note]) {
+            tap_pending[note] = 0;
+            if (mapped(&dbl[note])) {
+                tap_wait[note] = 1;
+                start_timer(note, T_WAIT, dbl_ms);
+            } else {
+                run_action(&tapped[note]);
+                logf_("remap %d (tap)\n", note);
+            }
+            return;
+        }
+        if (!press && long_active[note]) {
+            long_active[note] = 0;
+            push_btn(note, 0);
+            return;
+        }
+        if (press && !holding && mapped(&tapped[note])) {
+            if (tap_wait[note]) {
+                tap_wait[note] = 0;
+                ++press_seq[note];
+                run_action(&dbl[note]);
+                if (dbl[note].keep) {
+                    push_btn(dbl[note].keep - 1, 0x7f);
+                    keep_out[note] = dbl[note].keep;
+                    keep_start[note] = now_ms();
+                } else {
+                    swallow_release[note] = 1;
+                }
+                logf_("remap %d (double)\n", note);
+                return;
+            }
+            tap_pending[note] = 1;
+            start_timer(note, T_LONG, long_ms);
+            return;
+        }
+        if (press && holding && mapped(&shifted[note])) {
+            run_action(&shifted[note]);
+            swallow_release[note] = 1;
+            logf_("remap %d (hold)\n", note);
+            return;
+        }
+        if (press && (mapped(&single[note]) || mapped(&dbl[note])) && !holding) {
             long long t = now_ms();
             const struct action *a = &single[note];
             if (mapped(&dbl[note]) && last_press[note] && t - last_press[note] <= dbl_ms) {
@@ -308,7 +564,7 @@ static void handle_msg(void)
             } else {
                 last_press[note] = t;
             }
-            if (run_action(a)) {
+            if (mapped(a) && run_action(a)) {
                 swallow_release[note] = 1;
                 logf_("remap %d%s\n", note, a == &dbl[note] ? " (double)" : "");
                 return;
@@ -421,6 +677,17 @@ __attribute__((visibility("default"))) int snd_rawmidi_open(snd_rawmidi_t **in, 
         load_conf();
         if (is_private(*in, name)) {
             priv_in = *in;
+            int (*pdesc)(snd_rawmidi_t *, struct pollfd *, unsigned int) =
+                dlsym(RTLD_DEFAULT, "snd_rawmidi_poll_descriptors");
+            struct pollfd pfd;
+            priv_fd = pdesc && pdesc(*in, &pfd, 1) == 1 ? pfd.fd : -1;
+            if (wake_fd[0] < 0 && pipe2(wake_fd, O_NONBLOCK | O_CLOEXEC) != 0)
+                wake_fd[0] = wake_fd[1] = -1;
+            memset(tap_pending, 0, sizeof tap_pending);
+            memset(long_active, 0, sizeof long_active);
+            memset(tap_wait, 0, sizeof tap_wait);
+            memset(keep_out, 0, sizeof keep_out);
+            logf_("private fd %d\n", priv_fd);
             qhead = qtail = 0;
             msg_len = 0;
             in_sysex = 0;
@@ -431,6 +698,60 @@ __attribute__((visibility("default"))) int snd_rawmidi_open(snd_rawmidi_t **in, 
         pthread_mutex_unlock(&lock);
     }
     return r;
+}
+
+// The reader waits in poll() on the private fd; a long press fires from a timer, so poll also
+// watches a wake pipe and reports the private fd readable while injected bytes are queued.
+__attribute__((visibility("default"))) int poll(struct pollfd *fds, nfds_t nfds, int timeout)
+{
+    static int (*real_poll)(struct pollfd *, nfds_t, int);
+    if (!real_poll)
+        real_poll = dlsym(RTLD_NEXT, "poll");
+    int idx = -1;
+    if (priv_fd >= 0 && wake_fd[0] >= 0 && nfds < 16)
+        for (nfds_t i = 0; i < nfds; i++)
+            if (fds[i].fd == priv_fd && (fds[i].events & POLLIN))
+                idx = (int)i;
+    if (idx < 0)
+        return real_poll(fds, nfds, timeout);
+
+    pthread_mutex_lock(&lock);
+    int queued = qhead != qtail;
+    pthread_mutex_unlock(&lock);
+    if (queued) {
+        for (nfds_t i = 0; i < nfds; i++)
+            fds[i].revents = 0;
+        fds[idx].revents = POLLIN;
+        return 1;
+    }
+
+    struct pollfd all[16];
+    memcpy(all, fds, nfds * sizeof *fds);
+    all[nfds].fd = wake_fd[0];
+    all[nfds].events = POLLIN;
+    all[nfds].revents = 0;
+    int r = real_poll(all, nfds + 1, timeout);
+    if (r < 0)
+        return r;
+    for (nfds_t i = 0; i < nfds; i++)
+        fds[i].revents = all[i].revents;
+    if (all[nfds].revents) {
+        char drain[64];
+        while (read(wake_fd[0], drain, sizeof drain) > 0)
+            ;
+        r--;
+        if (!fds[idx].revents) {
+            fds[idx].revents = POLLIN;
+            r++;
+        }
+    }
+    return r;
+}
+
+__attribute__((visibility("default"))) int __poll_chk(struct pollfd *fds, nfds_t nfds, int timeout, size_t len)
+{
+    (void)len;
+    return poll(fds, nfds, timeout);
 }
 
 __attribute__((visibility("default"))) ssize_t snd_rawmidi_read(snd_rawmidi_t *h, void *buffer, size_t size)
