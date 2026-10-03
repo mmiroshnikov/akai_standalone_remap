@@ -1,5 +1,7 @@
 # akai_standalone_remap
 
+![MPC Live: Pad Bank A–D open the top row of the Mode Menu, + and − open the second row](docs/mpc-live-remapped.jpg)
+
 Remap the hardware buttons of standalone Akai MPC / Force devices: open any screen from any button,
 add double taps, long presses and Shift layers. Tested on a first-generation MPC Live (Hakai,
 MPC 3.9.1) and an Akai Force (stock firmware 3.9.0).
