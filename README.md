@@ -79,6 +79,8 @@ number, decimal or `0x` hex.
 log 1                    log every input byte to /tmp/hwremap.log (keep 0 normally)
 hold 49                  while this button (Shift) is held, remapped buttons pass through...
 held 1 u49 b1 d49        ...unless a "held" rule exists for them: then it runs instead
+combo 2 95 t10,20      while button 2 is held, pressing 95 runs this (any number of hold buttons,
+                         up to 32 combo rules); the held button itself still goes through
 
 54 d123 p0x30 u123       on press of 54: Menu down, tap pad 0x30, Menu up
 dbl 54 d123 p0x2D u123   second press within dblms runs this instead
